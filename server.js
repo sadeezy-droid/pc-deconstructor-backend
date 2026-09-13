@@ -18,8 +18,11 @@ app.post('/api/breakdown', async (req, res) => {
       return res.status(400).json({ error: 'URL is required' });
     }
 
-    // Clean tracking parameters from URL
+    // Clean tracking parameters and extract product slug from URL
     const cleanUrl = rawUrl.split('?')[0];
+    const urlParts = cleanUrl.split('/').filter(Boolean);
+    const productSlug = urlParts[urlParts.length - 2] || urlParts[urlParts.length - 1] || cleanUrl;
+    const readableSlug = decodeURIComponent(productSlug).replace(/[-_]/g, ' ');
 
     // Try basic HTML scraping
     let pageText = '';
@@ -35,59 +38,65 @@ app.post('/api/breakdown', async (req, res) => {
 
       const $ = cheerio.load(response.data);
       $('script, style, svg, nav, footer, iframe').remove();
-      pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 10000);
+      pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 8000);
     } catch (fetchErr) {
-      console.warn('Direct HTML scrape blocked/failed. Relying on Google Search grounding fallback.');
+      console.warn('Direct HTML scrape blocked. Extracting specs from URL slug and context.');
     }
 
-    // Prepare prompt with Google Search tool enabled
     const prompt = `
-    Target Prebuilt PC URL: ${cleanUrl}
-    Scraped Content Snippet: ${pageText || 'None (blocked by target site). Search for this exact product URL slug or model to retrieve specs.'}
+    You are an expert PC hardware builder.
+    Analyze the following prebuilt PC details and extract all hardware components into a structured list.
 
-    TASK: Extract all hardware components of this prebuilt computer (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
+    Product Title/Slug from URL: "${readableSlug}"
+    Target URL: "${cleanUrl}"
+    Page Content Snippet: "${pageText.slice(0, 2000)}"
 
-    CRITICAL REQUIREMENT: Output MUST be a valid, raw JSON object ONLY. Do not write introductory words, explanations, or citations outside the JSON.
-
-    Format:
-    {
-      "pcTitle": "Full Product Name",
-      "parts": [
-        {
-          "category": "CPU",
-          "name": "Component Model Name",
-          "estimatedPrice": "$XXX CAD",
-          "searchUrl": "https://www.google.com/search?q=buy+COMPONENT_NAME"
-        }
-      ]
-    }
+    Extract or infer these core parts: CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case.
+    Provide realistic estimated retail prices in CAD/USD for each individual part.
     `;
 
-    // Request response using Google Search Grounding tool
+    // Strict JSON Mode using responseSchema
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
-        tools: [{ googleSearch: {} }]
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            pcTitle: { type: 'STRING' },
+            parts: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  category: { type: 'STRING' },
+                  name: { type: 'STRING' },
+                  estimatedPrice: { type: 'STRING' },
+                  searchUrl: { type: 'STRING' }
+                },
+                required: ['category', 'name', 'estimatedPrice', 'searchUrl']
+              }
+            }
+          },
+          required: ['pcTitle', 'parts']
+        }
       }
     });
 
-    let rawText = response.text ? response.text.trim() : '';
+    const result = JSON.parse(response.text);
 
-    // Extract strictly the JSON block using Regex matching
-    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error('Gemini response did not contain a valid JSON structure.');
-    }
-
-    const cleanJsonString = jsonMatch[0];
-    const result = JSON.parse(cleanJsonString);
+    // Ensure searchUrl is pre-filled if model leaves it basic
+    result.parts = result.parts.map(part => ({
+      ...part,
+      searchUrl: part.searchUrl || `https://www.google.com/search?q=buy+${encodeURIComponent(part.name)}`
+    }));
 
     res.json(result);
 
   } catch (error) {
     console.error('Extraction Error Details:', error);
-    res.status(500).json({ error: 'Could not extract specs from that URL. Please check the link or try another.' });
+    res.status(500).json({ error: 'Could not extract specs from that URL. Please try another product link.' });
   }
 });
 
