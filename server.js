@@ -8,7 +8,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Initialize Gemini Client
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 app.post('/api/breakdown', async (req, res) => {
@@ -18,7 +17,7 @@ app.post('/api/breakdown', async (req, res) => {
       return res.status(400).json({ error: 'URL is required' });
     }
 
-    // Clean tracking parameters and extract product slug from URL
+    // 1. Clean tracking parameters and parse URL slug fallback
     const cleanUrl = rawUrl.split('?')[0];
     const pathSegments = cleanUrl.split('/').filter(Boolean);
     const rawSlug = pathSegments[pathSegments.length - 2] || pathSegments[pathSegments.length - 1] || '';
@@ -26,36 +25,40 @@ app.post('/api/breakdown', async (req, res) => {
 
     let pageText = '';
 
-    // Attempt ScraperAPI retrieval if key exists
+    // 2. Route request through ScraperAPI if key is available
     if (process.env.SCRAPERAPI_KEY) {
       try {
-        // Encode the target URL for ScraperAPI request
-        const scraperApiUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPERAPI_KEY}&url=${encodeURIComponent(cleanUrl)}&render=true`;
+        console.log('Sending request to ScraperAPI...');
+        // Omit render=true to speed up response from 20s to ~3s
+        const scraperApiUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPERAPI_KEY}&url=${encodeURIComponent(cleanUrl)}`;
 
-        const response = await axios.get(scraperApiUrl, { timeout: 20000 });
+        const response = await axios.get(scraperApiUrl, { timeout: 15000 });
 
         if (response && response.data) {
           const $ = cheerio.load(response.data);
-          $('script, style, svg, nav, footer, iframe').remove();
+          $('script:not([type="application/ld+json"]), style, svg, nav, footer, iframe').remove();
           pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 10000);
+          console.log('ScraperAPI successfully returned page content!');
         }
       } catch (scraperErr) {
-        console.warn('ScraperAPI request failed or timed out. Falling back to URL slug extraction:', scraperErr.message);
+        console.error('ScraperAPI Error Details:', scraperErr.response?.data || scraperErr.message);
       }
+    } else {
+      console.warn('SCRAPERAPI_KEY environment variable is missing in Render settings!');
     }
 
+    // 3. Prompt Gemini 2.5 Flash
     const prompt = `
     You are an expert PC hardware component extractor.
     Target Prebuilt PC URL: "${cleanUrl}"
-    URL Product Slug: "${cleanSlug}"
-    Full Webpage Content: "${pageText.slice(0, 4000) || 'Scrape unavailable. Rely strictly on URL slug specs.'}"
+    Product Title Slug: "${cleanSlug}"
+    Page Content: "${pageText.slice(0, 5000) || 'Scraped content empty. Deduce specs strictly from product title slug.'}"
 
-    INSTRUCTIONS:
-    Extract all individual hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
+    Instructions:
+    Extract or infer individual hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
     Provide estimated retail prices in CAD or USD for each component.
     `;
 
-    // Execute Gemini API call with strict JSON response structure
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: prompt,
@@ -86,7 +89,6 @@ app.post('/api/breakdown', async (req, res) => {
 
     const result = JSON.parse(response.text);
 
-    // Format search URLs for individual parts
     result.parts = result.parts.map(part => ({
       ...part,
       searchUrl: part.searchUrl || `https://www.google.com/search?q=buy+${encodeURIComponent(part.name)}`
@@ -95,7 +97,7 @@ app.post('/api/breakdown', async (req, res) => {
     return res.json(result);
 
   } catch (error) {
-    console.error('Extraction Failure:', error);
+    console.error('Final Extraction Failure:', error.message || error);
     return res.status(500).json({ error: 'Could not extract specs from that URL. Please try another product link.' });
   }
 });
