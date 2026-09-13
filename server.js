@@ -17,7 +17,7 @@ app.post('/api/breakdown', async (req, res) => {
       return res.status(400).json({ error: 'URL is required' });
     }
 
-    // 1. Clean tracking parameters and parse URL slug fallback
+    // Clean tracking parameters and parse URL slug
     const cleanUrl = rawUrl.split('?')[0];
     const pathSegments = cleanUrl.split('/').filter(Boolean);
     const rawSlug = pathSegments[pathSegments.length - 2] || pathSegments[pathSegments.length - 1] || '';
@@ -25,38 +25,34 @@ app.post('/api/breakdown', async (req, res) => {
 
     let pageText = '';
 
-    // 2. Route request through ScraperAPI if key is available
+    // Fetch via ScraperAPI if key is available
     if (process.env.SCRAPERAPI_KEY) {
       try {
-        console.log('Sending request to ScraperAPI...');
-        // Omit render=true to speed up response from 20s to ~3s
+        console.log('Fetching webpage via ScraperAPI...');
         const scraperApiUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPERAPI_KEY}&url=${encodeURIComponent(cleanUrl)}`;
-
         const response = await axios.get(scraperApiUrl, { timeout: 15000 });
 
         if (response && response.data) {
           const $ = cheerio.load(response.data);
           $('script:not([type="application/ld+json"]), style, svg, nav, footer, iframe').remove();
           pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 10000);
-          console.log('ScraperAPI successfully returned page content!');
         }
       } catch (scraperErr) {
-        console.error('ScraperAPI Error Details:', scraperErr.response?.data || scraperErr.message);
+        console.warn('ScraperAPI error:', scraperErr.message);
       }
-    } else {
-      console.warn('SCRAPERAPI_KEY environment variable is missing in Render settings!');
     }
 
-    // 3. Prompt Gemini 2.5 Flash
     const prompt = `
-    You are an expert PC hardware component extractor.
-    Target Prebuilt PC URL: "${cleanUrl}"
-    Product Title Slug: "${cleanSlug}"
-    Page Content: "${pageText.slice(0, 5000) || 'Scraped content empty. Deduce specs strictly from product title slug.'}"
+    You are an expert PC hardware component extractor analyzing a prebuilt gaming PC listing.
+    Target URL: "${cleanUrl}"
+    Product Slug: "${cleanSlug}"
+    Webpage Content: "${pageText.slice(0, 5000) || 'Deduce specs from product title slug.'}"
 
-    Instructions:
-    Extract or infer individual hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
-    Provide estimated retail prices in CAD or USD for each component.
+    INSTRUCTIONS:
+    1. Identify the prebuilt system's title and its retail listing price in CAD ($).
+    2. Extract/infer individual hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
+    3. Provide estimated individual retail prices in CAD ($) as raw numeric numbers (e.g. 250 for $250 CAD).
+    4. Focus search options on major Canadian computer retailers (Canada Computers, Amazon Canada, Memory Express, Newegg Canada).
     `;
 
     const response = await ai.models.generateContent({
@@ -68,6 +64,7 @@ app.post('/api/breakdown', async (req, res) => {
           type: 'OBJECT',
           properties: {
             pcTitle: { type: 'STRING' },
+            prebuiltPriceCAD: { type: 'NUMBER', description: 'Listed prebuilt retail price in CAD (number only)' },
             parts: {
               type: 'ARRAY',
               items: {
@@ -75,30 +72,59 @@ app.post('/api/breakdown', async (req, res) => {
                 properties: {
                   category: { type: 'STRING' },
                   name: { type: 'STRING' },
-                  estimatedPrice: { type: 'STRING' },
-                  searchUrl: { type: 'STRING' }
+                  estimatedPriceCAD: { type: 'NUMBER', description: 'Individual part price in CAD (number only)' }
                 },
-                required: ['category', 'name', 'estimatedPrice']
+                required: ['category', 'name', 'estimatedPriceCAD']
               }
             }
           },
-          required: ['pcTitle', 'parts']
+          required: ['pcTitle', 'prebuiltPriceCAD', 'parts']
         }
       }
     });
 
     const result = JSON.parse(response.text);
 
-    result.parts = result.parts.map(part => ({
-      ...part,
-      searchUrl: part.searchUrl || `https://www.google.com/search?q=buy+${encodeURIComponent(part.name)}`
-    }));
+    // Calculate total parts cost
+    let totalPartsCostCAD = 0;
+    
+    result.parts = result.parts.map(part => {
+      const priceNum = Number(part.estimatedPriceCAD) || 0;
+      totalPartsCostCAD += priceNum;
 
-    return res.json(result);
+      const encodedName = encodeURIComponent(part.name);
+      
+      return {
+        ...part,
+        estimatedPriceFormatted: `$${priceNum.toFixed(2)} CAD`,
+        retailerLinks: {
+          canadaComputers: `https://www.canadacomputers.com/search/results_setting.php?keywords=${encodedName}`,
+          amazonCA: `https://www.amazon.ca/s?k=${encodedName}`,
+          memoryExpress: `https://www.memoryexpress.com/Search/Products?Search=${encodedName}`,
+          neweggCA: `https://www.newegg.ca/p/pl?d=${encodedName}`
+        }
+      };
+    });
+
+    const prebuiltPrice = Number(result.prebuiltPriceCAD) || 0;
+    const priceDifference = prebuiltPrice - totalPartsCostCAD;
+
+    // Build complete summary payload
+    const finalResponse = {
+      pcTitle: result.pcTitle,
+      prebuiltPriceFormatted: prebuiltPrice > 0 ? `$${prebuiltPrice.toFixed(2)} CAD` : 'Price not found',
+      totalPartsCostFormatted: `$${totalPartsCostCAD.toFixed(2)} CAD`,
+      priceDifferenceFormatted: priceDifference >= 0 
+        ? `+$${priceDifference.toFixed(2)} CAD (Prebuilt Premium)` 
+        : `-$${Math.abs(priceDifference).toFixed(2)} CAD (DIY Savings)`,
+      parts: result.parts
+    };
+
+    return res.json(finalResponse);
 
   } catch (error) {
-    console.error('Final Extraction Failure:', error.message || error);
-    return res.status(500).json({ error: 'Could not extract specs from that URL. Please try another product link.' });
+    console.error('Extraction Failure:', error.message || error);
+    return res.status(500).json({ error: 'Could not extract specs from that URL.' });
   }
 });
 
