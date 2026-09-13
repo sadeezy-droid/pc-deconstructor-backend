@@ -42,13 +42,14 @@ app.post('/api/breakdown', async (req, res) => {
 
     // Prepare prompt with Google Search tool enabled
     const prompt = `
-    You are a hardware component extraction assistant.
     Target Prebuilt PC URL: ${cleanUrl}
-    Scraped HTML Snippet: ${pageText || 'None (scrapes were blocked). Use Google Search to look up this exact URL or product slug to find the specs.'}
+    Scraped Content Snippet: ${pageText || 'None (blocked by target site). Search for this exact product URL slug or model to retrieve specs.'}
 
-    Instructions:
-    1. Extract or search for the exact components of this prebuilt computer (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
-    2. Respond with ONLY a raw JSON object matching this exact structure:
+    TASK: Extract all hardware components of this prebuilt computer (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
+
+    CRITICAL REQUIREMENT: Output MUST be a valid, raw JSON object ONLY. Do not write introductory words, explanations, or citations outside the JSON.
+
+    Format:
     {
       "pcTitle": "Full Product Name",
       "parts": [
@@ -60,7 +61,6 @@ app.post('/api/breakdown', async (req, res) => {
         }
       ]
     }
-    3. Do NOT wrap the JSON in markdown code blocks like \`\`\`json. Return pure JSON text only.
     `;
 
     // Request response using Google Search Grounding tool
@@ -72,18 +72,21 @@ app.post('/api/breakdown', async (req, res) => {
       }
     });
 
-    let rawText = response.text.trim();
-    
-    // Clean potential markdown formatting if returned
-    if (rawText.startsWith('```')) {
-      rawText = rawText.replace(/^```(json)?\n?/, '').replace(/\n?```$/, '').trim();
+    let rawText = response.text ? response.text.trim() : '';
+
+    // Extract strictly the JSON block using Regex matching
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error('Gemini response did not contain a valid JSON structure.');
     }
 
-    const result = JSON.parse(rawText);
+    const cleanJsonString = jsonMatch[0];
+    const result = JSON.parse(cleanJsonString);
+
     res.json(result);
 
   } catch (error) {
-    console.error('Extraction Error:', error);
+    console.error('Extraction Error Details:', error);
     res.status(500).json({ error: 'Could not extract specs from that URL. Please check the link or try another.' });
   }
 });
