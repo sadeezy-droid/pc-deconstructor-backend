@@ -21,65 +21,70 @@ app.post('/api/breakdown', async (req, res) => {
     // Clean tracking parameters from URL
     const cleanUrl = rawUrl.split('?')[0];
 
-    // Fetch page with realistic browser headers
+    // Try basic HTML scraping
     let pageText = '';
     try {
       const response = await axios.get(cleanUrl, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Cache-Control': 'no-cache'
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9'
         },
-        timeout: 10000
+        timeout: 8000
       });
 
       const $ = cheerio.load(response.data);
-      
-      // Remove scripts, styles, and SVG junk to save token space
       $('script, style, svg, nav, footer, iframe').remove();
-      pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 15000);
+      pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 10000);
     } catch (fetchErr) {
-      console.warn('Scraping direct HTML failed, passing URL directly to Gemini context:', fetchErr.message);
+      console.warn('Direct HTML scrape blocked/failed. Relying on Google Search grounding fallback.');
     }
 
-    // Prepare prompt for Gemini
+    // Prepare prompt with Google Search tool enabled
     const prompt = `
-    Extract computer hardware specs from this URL and text context.
-    Target URL: ${cleanUrl}
-    Context Snippet: ${pageText || 'Extract based on model details found in the URL structure or product path.'}
+    You are a hardware component extraction assistant.
+    Target Prebuilt PC URL: ${cleanUrl}
+    Scraped HTML Snippet: ${pageText || 'None (scrapes were blocked). Use Google Search to look up this exact URL or product slug to find the specs.'}
 
-    Return ONLY a valid JSON object matching this exact structure, with no markdown formatting or extra text:
+    Instructions:
+    1. Extract or search for the exact components of this prebuilt computer (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
+    2. Respond with ONLY a raw JSON object matching this exact structure:
     {
-      "pcTitle": "Full Prebuilt PC Name",
+      "pcTitle": "Full Product Name",
       "parts": [
         {
-          "category": "CPU / GPU / RAM / Storage / Motherboard / Power Supply / Case",
-          "name": "Exact component model name",
-          "estimatedPrice": "$XXX CAD or USD",
-          "searchUrl": "https://www.google.com/search?q=buy+EXACT_COMPONENT_NAME"
+          "category": "CPU",
+          "name": "Component Model Name",
+          "estimatedPrice": "$XXX CAD",
+          "searchUrl": "https://www.google.com/search?q=buy+COMPONENT_NAME"
         }
       ]
     }
+    3. Do NOT wrap the JSON in markdown code blocks like \`\`\`json. Return pure JSON text only.
     `;
 
-    // Request response from Gemini 2.5 Flash
+    // Request response using Google Search Grounding tool
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
-        responseMimeType: 'application/json'
+        tools: [{ googleSearch: {} }]
       }
     });
 
-    const jsonText = response.text.trim();
-    const result = JSON.parse(jsonText);
+    let rawText = response.text.trim();
+    
+    // Clean potential markdown formatting if returned
+    if (rawText.startsWith('```')) {
+      rawText = rawText.replace(/^```(json)?\n?/, '').replace(/\n?```$/, '').trim();
+    }
 
+    const result = JSON.parse(rawText);
     res.json(result);
 
   } catch (error) {
     console.error('Extraction Error:', error);
-    res.status(500).json({ error: 'Could not extract specs from that URL. Please try another product link.' });
+    res.status(500).json({ error: 'Could not extract specs from that URL. Please check the link or try another.' });
   }
 });
 
