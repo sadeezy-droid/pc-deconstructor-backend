@@ -24,38 +24,39 @@ app.post('/api/breakdown', async (req, res) => {
     const productSlug = urlParts[urlParts.length - 2] || urlParts[urlParts.length - 1] || cleanUrl;
     const readableSlug = decodeURIComponent(productSlug).replace(/[-_]/g, ' ');
 
-    // Try basic HTML scraping
+    // Safely attempt HTML scraping with absolute error isolation
     let pageText = '';
     try {
       const response = await axios.get(cleanUrl, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9'
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         },
-        timeout: 8000
+        timeout: 4000
       });
 
-      const $ = cheerio.load(response.data);
-      $('script, style, svg, nav, footer, iframe').remove();
-      pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 8000);
-    } catch (fetchErr) {
-      console.warn('Direct HTML scrape blocked. Extracting specs from URL slug and context.');
+      if (response && response.data) {
+        const $ = cheerio.load(response.data);
+        $('script, style, svg, nav, footer, iframe').remove();
+        pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 5000);
+      }
+    } catch (scrapeErr) {
+      console.log('Web fetch bypassed, utilizing URL slug context.');
     }
 
     const prompt = `
     You are an expert PC hardware builder.
-    Analyze the following prebuilt PC details and extract all hardware components into a structured list.
+    Extract the hardware components for this prebuilt computer.
 
-    Product Title/Slug from URL: "${readableSlug}"
-    Target URL: "${cleanUrl}"
-    Page Content Snippet: "${pageText.slice(0, 2000)}"
+    URL Slug: "${readableSlug}"
+    Full Target URL: "${cleanUrl}"
+    Page Context: "${pageText.slice(0, 1500)}"
 
-    Extract or infer these core parts: CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case.
-    Provide realistic estimated retail prices in CAD/USD for each individual part.
+    Instructions:
+    Identify or infer the core hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
+    Provide estimated retail prices in CAD/USD for each individual component.
     `;
 
-    // Strict JSON Mode using responseSchema
+    // Execute Gemini call with strict JSON schema
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: prompt,
@@ -75,7 +76,7 @@ app.post('/api/breakdown', async (req, res) => {
                   estimatedPrice: { type: 'STRING' },
                   searchUrl: { type: 'STRING' }
                 },
-                required: ['category', 'name', 'estimatedPrice', 'searchUrl']
+                required: ['category', 'name', 'estimatedPrice']
               }
             }
           },
@@ -84,19 +85,23 @@ app.post('/api/breakdown', async (req, res) => {
       }
     });
 
+    if (!response || !response.text) {
+      throw new Error('Empty response from AI model.');
+    }
+
     const result = JSON.parse(response.text);
 
-    // Ensure searchUrl is pre-filled if model leaves it basic
+    // Auto-generate search links for components
     result.parts = result.parts.map(part => ({
       ...part,
       searchUrl: part.searchUrl || `https://www.google.com/search?q=buy+${encodeURIComponent(part.name)}`
     }));
 
-    res.json(result);
+    return res.json(result);
 
   } catch (error) {
-    console.error('Extraction Error Details:', error);
-    res.status(500).json({ error: 'Could not extract specs from that URL. Please try another product link.' });
+    console.error('Extraction Failure:', error.message || error);
+    return res.status(500).json({ error: 'Could not extract specs from that URL. Please try another product link.' });
   }
 });
 
