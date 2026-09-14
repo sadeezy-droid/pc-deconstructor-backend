@@ -34,7 +34,7 @@ function cleanPartForRetailerSearch(name, category = '') {
 
   const catLower = category.toLowerCase();
 
-  // Dynamic context append: Add category type ONLY if missing, without assuming generation
+  // Dynamic context append: Add category type ONLY if missing
   if (catLower.includes('ram') || catLower.includes('memory')) {
     if (!/ram|ddr|memory/i.test(cleaned)) {
       cleaned += ' Desktop RAM';
@@ -139,9 +139,14 @@ app.post('/api/breakdown', async (req, res) => {
       }
     }
 
-    // STEP 3: Analyze Specs using Gemini LLM
+    // Fallback pageText to slug if scraping returned empty text
+    if (!pageText) {
+      pageText = `Product listing slug: ${cleanSlug.replace(/-/g, ' ')}`;
+    }
+
+    // STEP 3: Analyze Specs using Gemini LLM (Set to gemini-3.6-flash)
     const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
+      model: 'gemini-3.6-flash',
       generationConfig: { responseMimeType: 'application/json' }
     });
 
@@ -210,7 +215,11 @@ Return ONLY JSON matching this structure:
     });
 
   } catch (error) {
-    console.error('Error during breakdown process:', error);
+    console.error('Error during breakdown process:', {
+      message: error.message,
+      status: error.status,
+      responseData: error.response?.data
+    });
     return res.status(500).json({ error: 'Failed to extract PC breakdown. Please verify the URL.' });
   }
 });
