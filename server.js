@@ -52,19 +52,25 @@ app.post('/api/breakdown', async (req, res) => {
 
     if (process.env.SCRAPERAPI_KEY) {
       try {
-        console.log('Fetching webpage via ScraperAPI...');
-        const scraperApiUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPERAPI_KEY}&url=${encodeURIComponent(cleanUrl)}`;
-        const response = await axios.get(scraperApiUrl, { timeout: 15000 });
+        // Detect JS-heavy sites like Best Buy to selectively enable render=true
+        const needsJsRender = cleanUrl.toLowerCase().includes('bestbuy');
+        const renderParam = needsJsRender ? '&render=true' : '';
+        
+        console.log(`Fetching ${cleanUrl} via ScraperAPI (JS Render: ${needsJsRender})...`);
+        const scraperApiUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPERAPI_KEY}&url=${encodeURIComponent(cleanUrl)}${renderParam}`;
+        
+        // Increase timeout for JS-rendered requests (25s vs 15s)
+        const timeoutMs = needsJsRender ? 25000 : 15000;
+        const response = await axios.get(scraperApiUrl, { timeout: timeoutMs });
 
         if (response && response.data) {
           const $ = cheerio.load(response.data);
 
-          // 1. Look for structured JSON-LD data (Best Buy & Canada Computers both publish this)
+          // 1. Check for structured JSON-LD data
           $('script[type="application/ld+json"]').each((_, el) => {
             try {
               const jsonData = JSON.parse($(el).html() || '{}');
               
-              // Handle Schema.org Product or Offer arrays
               const offers = jsonData.offers || (jsonData['@graph'] && jsonData['@graph'].find(o => o.offers)?.offers);
               if (offers) {
                 const offerObj = Array.isArray(offers) ? offers[0] : offers;
@@ -73,12 +79,10 @@ app.post('/api/breakdown', async (req, res) => {
               } else if (jsonData.price) {
                 extractedExactPrice = parseFloat(jsonData.price);
               }
-            } catch (e) {
-              // Ignore invalid JSON blobs
-            }
+            } catch (e) {}
           });
 
-          // 2. Fallback to OpenGraph / Schema Meta tags if JSON-LD isn't present
+          // 2. Fallback to OpenGraph / Schema Meta tags
           if (!extractedExactPrice) {
             const metaPrice = 
               $('meta[property="product:price:amount"]').attr('content') ||
@@ -140,7 +144,6 @@ app.post('/api/breakdown', async (req, res) => {
 
     const result = JSON.parse(response.text);
 
-    // Prioritize the structured extracted price over AI estimation
     const finalPrebuiltPrice = extractedExactPrice || Number(result.prebuiltPriceCAD) || 0;
 
     let totalPartsCostCAD = 0;
