@@ -1,29 +1,66 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const cheerio = require('cheerio');
-const { GoogleGenAI } = require('@google/genai');
+import express from 'express';
+import cors from 'cors';
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Initialize Gemini API
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-function cleanPartForRetailerSearch(name) {
+// Extract SKU from Best Buy Canada URLs
+function getBestBuySku(url) {
+  try {
+    const match = url.match(/\/(\d{8}|\d{7})(?:\?|$|\/)/);
+    return match ? match[1] : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Clean component names while PRESERVING exact technical terms extracted by Gemini
+function cleanPartForRetailerSearch(name, category = '') {
   if (!name) return '';
+  
   let cleaned = name
-    .replace(/\b(Intel|AMD|NVIDIA|GeForce|Radeon|Corsair|Kingston|Samsung|Crucial|MSI|ASUS|Gigabyte|EVGA|Thermaltake|DeepCool|Cooler Master|Western Digital|WD|Seagate)\b/gi, '')
-    .replace(/\b(DDR4|DDR5|PCIe|NVMe|M\.2|SSD|RAM|MHz|CL\d+|Desktop|Gaming|Graphics|Card|Processor|Power Supply|Modular|80\+|Plus|Gold|Bronze|Chassis|Tower|Case)\b/gi, '')
+    // Remove marketing hype, but keep technical specs (DDR4/DDR5/DDR6, PCIe, NVMe, RTX, etc.)
+    .replace(/\b(Desktop|Gaming|Graphics Card|Processor|Modular|80\+|Plus|Gold|Bronze|Chassis|Tower|System|Kit|Pack)\b/gi, '')
     .replace(/[^\w\s-]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+
+  const catLower = category.toLowerCase();
+
+  // Dynamic context append: Add category type ONLY if missing, without assuming generation
+  if (catLower.includes('ram') || catLower.includes('memory')) {
+    if (!/ram|ddr|memory/i.test(cleaned)) {
+      cleaned += ' Desktop RAM';
+    }
+  } else if (catLower.includes('storage') || catLower.includes('ssd') || catLower.includes('drive')) {
+    if (!/ssd|hdd|drive|storage|nvme|sata/i.test(cleaned)) {
+      cleaned += ' SSD';
+    }
+  } else if (catLower.includes('power') || catLower.includes('psu')) {
+    if (!/psu|power supply|watt|w\b/i.test(cleaned)) {
+      cleaned += ' Power Supply';
+    }
+  } else if (catLower.includes('motherboard') || catLower.includes('mobo')) {
+    if (!/motherboard|mobo|board/i.test(cleaned)) {
+      cleaned += ' Motherboard';
+    }
+  }
+
   return cleaned.length >= 2 ? cleaned : name;
 }
 
-function buildRetailerLinks(partName) {
-  const keyword = cleanPartForRetailerSearch(partName);
+// Build precise retailer search links using category context
+function buildRetailerLinks(partName, category = '') {
+  const keyword = cleanPartForRetailerSearch(partName, category);
   const encodedQuery = encodeURIComponent(keyword);
+
   return {
     canadaComputers: `https://www.canadacomputers.com/en/search?s=${encodedQuery}&t=1`,
     amazonCA: `https://www.amazon.ca/s?k=${encodedQuery}`,
@@ -32,170 +69,153 @@ function buildRetailerLinks(partName) {
   };
 }
 
-// Helper to extract 8-digit Best Buy SKU
-function getBestBuySku(url) {
-  const match = url.match(/\/(\d{8}|\d{7})(?:\?|$)/);
-  return match ? match[1] : null;
-}
-
+// Main API Breakdown Endpoint
 app.post('/api/breakdown', async (req, res) => {
   try {
     const rawUrl = req.body.url;
-    if (!rawUrl) return res.status(400).json({ error: 'URL is required' });
+    const manualPrice = req.body.manualPrice ? parseFloat(req.body.manualPrice) : null;
+
+    if (!rawUrl) {
+      return res.status(400).json({ error: 'A product URL is required.' });
+    }
 
     const cleanUrl = rawUrl.split('?')[0];
-    const pathSegments = cleanUrl.split('/').filter(Boolean);
-    const rawSlug = pathSegments[pathSegments.length - 2] || pathSegments[pathSegments.length - 1] || '';
-    const cleanSlug = decodeURIComponent(rawSlug).replace(/[-_]/g, ' ');
+    const urlParts = cleanUrl.split('/');
+    const cleanSlug = urlParts[urlParts.length - 1] || urlParts[urlParts.length - 2] || '';
 
+    let extractedExactPrice = manualPrice; // Priority 1: User Manual Input Override
     let pageText = '';
-    let extractedExactPrice = req.body.manualPrice ? parseFloat(req.body.manualPrice) : null;
 
-    // --- STEP 1: Direct Best Buy API Attempt ---
+    // STEP 1: Direct Best Buy API bypass (runs ONLY if no manual price supplied)
     if (!extractedExactPrice && cleanUrl.includes('bestbuy.ca')) {
       const sku = getBestBuySku(cleanUrl);
       if (sku) {
         try {
-          console.log(`Attempting direct Best Buy Canada API call for SKU ${sku}...`);
           const bbyApi = await axios.get(`https://www.bestbuy.ca/api/v2/json/product/${sku}`, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Accept': 'application/json'
-            },
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
             timeout: 6000
           });
-          
           if (bbyApi.data) {
             extractedExactPrice = parseFloat(bbyApi.data.salePrice || bbyApi.data.regularPrice || 0);
-            console.log(`Best Buy API success: Price found = $${extractedExactPrice}`);
           }
         } catch (e) {
-          console.warn('Best Buy Direct API skipped or failed:', e.message);
+          console.warn('Best Buy Direct API bypass failed or timed out. Falling back to ScraperAPI...');
         }
       }
     }
 
-    // --- STEP 2: ScraperAPI Web Scraping Fallback ---
+    // STEP 2: Fetch Page Content via ScraperAPI
     if (process.env.SCRAPERAPI_KEY) {
       try {
-        const needsJsRender = cleanUrl.toLowerCase().includes('bestbuy');
-        const renderParam = needsJsRender ? '&render=true' : '';
-        const scraperApiUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPERAPI_KEY}&url=${encodeURIComponent(cleanUrl)}${renderParam}`;
-        
-        console.log(`Fetching ${cleanUrl} via ScraperAPI...`);
-        const response = await axios.get(scraperApiUrl, { timeout: needsJsRender ? 25000 : 15000 });
+        const scraperUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPERAPI_KEY}&url=${encodeURIComponent(cleanUrl)}`;
+        const response = await axios.get(scraperUrl, { timeout: 25000 });
+        const $ = cheerio.load(response.data);
 
-        if (response && response.data) {
-          const $ = cheerio.load(response.data);
+        // DOM Price parsing if price is still missing
+        if (!extractedExactPrice) {
+          const priceSelectors = [
+            '[data-testid="customer-price"] span',
+            '.price_F22T3',
+            'span.a-price-whole',
+            '.product-price',
+            '[itemprop="price"]'
+          ];
 
-          // Dedicated Best Buy DOM Selector Extraction
-          if (!extractedExactPrice) {
-            const testPrice = $('[data-testid="customer-price"] span').first().text() || 
-                              $('[data-automation="product-price"]').first().text() ||
-                              $('.price_F22T3').first().text();
-            
-            const priceMatch = testPrice.match(/[\d,]+\.\d{2}/);
-            if (priceMatch) {
-              extractedExactPrice = parseFloat(priceMatch[0].replace(/,/g, ''));
+          for (const selector of priceSelectors) {
+            const priceStr = $(selector).first().text().replace(/[^\d.]/g, '');
+            if (priceStr && !isNaN(parseFloat(priceStr))) {
+              extractedExactPrice = parseFloat(priceStr);
+              break;
             }
           }
-
-          // JSON-LD Fallback
-          if (!extractedExactPrice) {
-            $('script[type="application/ld+json"]').each((_, el) => {
-              try {
-                const jsonData = JSON.parse($(el).html() || '{}');
-                const offers = jsonData.offers || (jsonData['@graph'] && jsonData['@graph'].find(o => o.offers)?.offers);
-                if (offers) {
-                  const offerObj = Array.isArray(offers) ? offers[0] : offers;
-                  const price = offerObj.price || offerObj.lowPrice;
-                  if (price) extractedExactPrice = parseFloat(price);
-                }
-              } catch (e) {}
-            });
-          }
-
-          $('script, style, svg, nav, footer, iframe').remove();
-          pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 8000);
         }
+
+        // Clean DOM body text for Gemini analysis
+        $('script, style, noscript, nav, footer, header').remove();
+        pageText = $('body').text().replace(/\s+/g, ' ').trim();
+
       } catch (err) {
-        console.warn('ScraperAPI fetch warning:', err.message);
+        console.warn('ScraperAPI fetch failed:', err.message);
       }
     }
 
-    const prompt = `
-    You are an expert PC hardware extractor.
-    Target PC Link: "${cleanUrl}"
-    Product Title Slug: "${cleanSlug}"
-    Webpage Content: "${pageText.slice(0, 4000)}"
-    ${extractedExactPrice ? `Verified Listed Page Price: $${extractedExactPrice} CAD` : ''}
-
-    INSTRUCTIONS:
-    1. Determine the exact LISTED PREBUILT PRICE in CAD ($). ${extractedExactPrice ? `Use $${extractedExactPrice} CAD directly.` : ''}
-    2. Extract individual hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
-    3. Keep part names clean and concise for retail searches (e.g., "Core Ultra 7 265F").
-    4. Provide realistic individual retail price estimates in CAD ($) as plain numbers.
-    `;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.6-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: 'OBJECT',
-          properties: {
-            pcTitle: { type: 'STRING' },
-            prebuiltPriceCAD: { type: 'NUMBER' },
-            parts: {
-              type: 'ARRAY',
-              items: {
-                type: 'OBJECT',
-                properties: {
-                  category: { type: 'STRING' },
-                  name: { type: 'STRING' },
-                  estimatedPriceCAD: { type: 'NUMBER' }
-                },
-                required: ['category', 'name', 'estimatedPriceCAD']
-              }
-            }
-          },
-          required: ['pcTitle', 'prebuiltPriceCAD', 'parts']
-        }
-      }
+    // STEP 3: Analyze Specs using Gemini LLM
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-1.5-flash',
+      generationConfig: { responseMimeType: 'application/json' }
     });
 
-    const result = JSON.parse(response.text);
-    const finalPrebuiltPrice = extractedExactPrice || Number(result.prebuiltPriceCAD) || 0;
+    const prompt = `
+You are an expert PC hardware extractor.
+Target PC Link: "${cleanUrl}"
+Product Title Slug: "${cleanSlug}"
+Webpage Content: "${pageText.slice(0, 4500)}"
+${extractedExactPrice ? `Verified Listed Page Price: $${extractedExactPrice} CAD` : ''}
 
+INSTRUCTIONS:
+1. Determine the exact LISTED PREBUILT PRICE in CAD ($). ${extractedExactPrice ? `Use $${extractedExactPrice} CAD directly.` : ''}
+2. Extract individual hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
+3. Component names MUST be clear and descriptive for retail searches:
+   - Extract the EXACT generation and specs provided in the source text (e.g. DDR4 vs DDR5 vs DDR6, Gen3 vs Gen4 vs Gen5 NVMe, SATA SSD, etc.). DO NOT guess or default to DDR5 unless specified or explicitly clear from the platform.
+   - Combine capacity and category into a complete search term (e.g. return "16GB DDR4 RAM" or "16GB DDR5 RAM", NEVER just "16GB").
+   - Storage: Combine capacity and drive type (e.g. "1TB NVMe SSD" or "1TB SATA SSD", NEVER just "1TB").
+   - GPU: Include full model (e.g., "GeForce RTX 4060 8GB").
+   - CPU: Include exact model (e.g., "Core i5-12400F" or "Ryzen 7 7700X").
+4. Provide realistic individual retail price estimates in CAD ($) as plain numbers.
+
+Return ONLY JSON matching this structure:
+{
+  "pcTitle": "Full PC Name",
+  "prebuiltPriceCAD": 1499.99,
+  "parts": [
+    {
+      "category": "RAM",
+      "name": "16GB DDR5 5600MHz RAM",
+      "estimatedPriceCAD": 85.00
+    }
+  ]
+}
+`;
+
+    const result = await model.generateContent(prompt);
+    const jsonResponse = JSON.parse(result.response.text());
+
+    // Calculate totals and generate clean retailer search URLs
     let totalPartsCostCAD = 0;
-    const formattedParts = result.parts.map(part => {
+    const finalPrebuiltPrice = extractedExactPrice || jsonResponse.prebuiltPriceCAD || 0;
+
+    const formattedParts = jsonResponse.parts.map(part => {
       const priceNum = Number(part.estimatedPriceCAD) || 0;
       totalPartsCostCAD += priceNum;
+
       return {
-        ...part,
+        category: part.category,
+        name: part.name,
         estimatedPriceFormatted: `$${priceNum.toFixed(2)} CAD`,
-        retailerLinks: buildRetailerLinks(part.name)
+        retailerLinks: buildRetailerLinks(part.name, part.category)
       };
     });
 
-    const priceDifference = finalPrebuiltPrice - totalPartsCostCAD;
+    const priceDiff = finalPrebuiltPrice - totalPartsCostCAD;
+    const priceDiffFormatted = priceDiff >= 0 
+      ? `+$${priceDiff.toFixed(2)} CAD (Prebuilt Premium)` 
+      : `-$${Math.abs(priceDiff).toFixed(2)} CAD (DIY Savings)`;
 
     return res.json({
-      pcTitle: result.pcTitle,
-      prebuiltPriceFormatted: finalPrebuiltPrice > 0 ? `$${finalPrebuiltPrice.toFixed(2)} CAD` : 'Price not found',
+      pcTitle: jsonResponse.pcTitle,
+      prebuiltPriceFormatted: `$${finalPrebuiltPrice.toFixed(2)} CAD`,
       totalPartsCostFormatted: `$${totalPartsCostCAD.toFixed(2)} CAD`,
-      priceDifferenceFormatted: priceDifference >= 0
-        ? `+$${priceDifference.toFixed(2)} CAD (Prebuilt Premium)`
-        : `-$${Math.abs(priceDifference).toFixed(2)} CAD (DIY Savings)`,
+      priceDifferenceFormatted: priceDiffFormatted,
       parts: formattedParts
     });
 
   } catch (error) {
-    console.error('Extraction Failure:', error.message || error);
-    return res.status(500).json({ error: 'Could not extract specs from that URL.' });
+    console.error('Error during breakdown process:', error);
+    return res.status(500).json({ error: 'Failed to extract PC breakdown. Please verify the URL.' });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`PC Deconstructor backend listening on port ${PORT}`);
+});
