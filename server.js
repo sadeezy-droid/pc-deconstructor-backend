@@ -26,7 +26,6 @@ function cleanPartForRetailerSearch(name, category = '') {
   if (!name) return '';
   
   let cleaned = name
-    // Remove marketing hype, but keep technical specs (DDR4/DDR5/DDR6, PCIe, NVMe, RTX, etc.)
     .replace(/\b(Desktop|Gaming|Graphics Card|Processor|Modular|80\+|Plus|Gold|Bronze|Chassis|Tower|System|Kit|Pack)\b/gi, '')
     .replace(/[^\w\s-]/g, '')
     .replace(/\s+/g, ' ')
@@ -34,7 +33,6 @@ function cleanPartForRetailerSearch(name, category = '') {
 
   const catLower = category.toLowerCase();
 
-  // Dynamic context append: Add category type ONLY if missing
   if (catLower.includes('ram') || catLower.includes('memory')) {
     if (!/ram|ddr|memory/i.test(cleaned)) {
       cleaned += ' Desktop RAM';
@@ -118,12 +116,14 @@ app.post('/api/breakdown', async (req, res) => {
             '.price_F22T3',
             'span.a-price-whole',
             '.product-price',
-            '[itemprop="price"]'
+            '[itemprop="price"]',
+            '.price',
+            '.product-price-value'
           ];
 
           for (const selector of priceSelectors) {
             const priceStr = $(selector).first().text().replace(/[^\d.]/g, '');
-            if (priceStr && !isNaN(parseFloat(priceStr))) {
+            if (priceStr && !isNaN(parseFloat(priceStr)) && parseFloat(priceStr) > 50) {
               extractedExactPrice = parseFloat(priceStr);
               break;
             }
@@ -144,7 +144,7 @@ app.post('/api/breakdown', async (req, res) => {
       pageText = `Product listing slug: ${cleanSlug.replace(/-/g, ' ')}`;
     }
 
-    // STEP 3: Analyze Specs using Gemini LLM (Set to gemini-3.6-flash)
+    // STEP 3: Analyze Specs using Gemini LLM (Locked to gemini-3.6-flash)
     const model = genAI.getGenerativeModel({
       model: 'gemini-3.6-flash',
       generationConfig: { responseMimeType: 'application/json' }
@@ -158,7 +158,7 @@ Webpage Content: "${pageText.slice(0, 4500)}"
 ${extractedExactPrice ? `Verified Listed Page Price: $${extractedExactPrice} CAD` : ''}
 
 INSTRUCTIONS:
-1. Determine the exact LISTED PREBUILT PRICE in CAD ($). ${extractedExactPrice ? `Use $${extractedExactPrice} CAD directly.` : ''}
+1. Determine the exact LISTED PREBUILT PRICE in CAD ($). ${extractedExactPrice ? `Set "prebuiltPriceCAD" to exactly ${extractedExactPrice}.` : 'Look inside the text/title for the prebuilt price. If missing, estimate a realistic prebuilt price in CAD.'}
 2. Extract individual hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
 3. Component names MUST be clear and descriptive for retail searches:
    - Extract the EXACT generation and specs provided in the source text (e.g. DDR4 vs DDR5 vs DDR6, Gen3 vs Gen4 vs Gen5 NVMe, SATA SSD, etc.). DO NOT guess or default to DDR5 unless specified or explicitly clear from the platform.
@@ -185,9 +185,14 @@ Return ONLY JSON matching this structure:
     const result = await model.generateContent(prompt);
     const jsonResponse = JSON.parse(result.response.text());
 
-    // Calculate totals and generate clean retailer search URLs
+    // Calculate totals and format values safely
     let totalPartsCostCAD = 0;
-    const finalPrebuiltPrice = extractedExactPrice || jsonResponse.prebuiltPriceCAD || 0;
+
+    // Guaranteed Price Extraction Hierarchy
+    let parsedGeminiPrice = parseFloat(jsonResponse.prebuiltPriceCAD);
+    if (isNaN(parsedGeminiPrice)) parsedGeminiPrice = 0;
+
+    const finalPrebuiltPrice = extractedExactPrice || parsedGeminiPrice || 0;
 
     const formattedParts = jsonResponse.parts.map(part => {
       const priceNum = Number(part.estimatedPriceCAD) || 0;
@@ -208,7 +213,9 @@ Return ONLY JSON matching this structure:
 
     return res.json({
       pcTitle: jsonResponse.pcTitle,
-      prebuiltPriceFormatted: `$${finalPrebuiltPrice.toFixed(2)} CAD`,
+      prebuiltPriceCAD: finalPrebuiltPrice, // Raw number for frontend state/editor
+      prebuiltPriceFormatted: `$${finalPrebuiltPrice.toFixed(2)} CAD`, // Formatted display string
+      totalPartsCostCAD: totalPartsCostCAD,
       totalPartsCostFormatted: `$${totalPartsCostCAD.toFixed(2)} CAD`,
       priceDifferenceFormatted: priceDiffFormatted,
       parts: formattedParts
