@@ -10,31 +10,32 @@ app.use(express.json());
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// Clean part names to generate clean retailer queries
 function cleanPartForRetailerSearch(name) {
   if (!name) return '';
-  
   let cleaned = name
     .replace(/\b(Intel|AMD|NVIDIA|GeForce|Radeon|Corsair|Kingston|Samsung|Crucial|MSI|ASUS|Gigabyte|EVGA|Thermaltake|DeepCool|Cooler Master|Western Digital|WD|Seagate)\b/gi, '')
     .replace(/\b(DDR4|DDR5|PCIe|NVMe|M\.2|SSD|RAM|MHz|CL\d+|Desktop|Gaming|Graphics|Card|Processor|Power Supply|Modular|80\+|Plus|Gold|Bronze|Chassis|Tower|Case)\b/gi, '')
     .replace(/[^\w\s-]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
-
   return cleaned.length >= 2 ? cleaned : name;
 }
 
-// Generate correct, up-to-date Canadian retailer search links
 function buildRetailerLinks(partName) {
   const keyword = cleanPartForRetailerSearch(partName);
   const encodedQuery = encodeURIComponent(keyword);
-
   return {
     canadaComputers: `https://www.canadacomputers.com/en/search?s=${encodedQuery}&t=1`,
     amazonCA: `https://www.amazon.ca/s?k=${encodedQuery}`,
     memoryExpress: `https://www.memoryexpress.com/Search/Products?Search=${encodedQuery}`,
     neweggCA: `https://www.newegg.ca/p/pl?d=${encodedQuery}`
   };
+}
+
+// Helper to extract 8-digit Best Buy SKU
+function getBestBuySku(url) {
+  const match = url.match(/\/(\d{8}|\d{7})(?:\?|$)/);
+  return match ? match[1] : null;
 }
 
 app.post('/api/breakdown', async (req, res) => {
@@ -48,48 +49,70 @@ app.post('/api/breakdown', async (req, res) => {
     const cleanSlug = decodeURIComponent(rawSlug).replace(/[-_]/g, ' ');
 
     let pageText = '';
-    let extractedExactPrice = null;
+    let extractedExactPrice = req.body.manualPrice ? parseFloat(req.body.manualPrice) : null;
 
+    // --- STEP 1: Direct Best Buy API Attempt ---
+    if (!extractedExactPrice && cleanUrl.includes('bestbuy.ca')) {
+      const sku = getBestBuySku(cleanUrl);
+      if (sku) {
+        try {
+          console.log(`Attempting direct Best Buy Canada API call for SKU ${sku}...`);
+          const bbyApi = await axios.get(`https://www.bestbuy.ca/api/v2/json/product/${sku}`, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Accept': 'application/json'
+            },
+            timeout: 6000
+          });
+          
+          if (bbyApi.data) {
+            extractedExactPrice = parseFloat(bbyApi.data.salePrice || bbyApi.data.regularPrice || 0);
+            console.log(`Best Buy API success: Price found = $${extractedExactPrice}`);
+          }
+        } catch (e) {
+          console.warn('Best Buy Direct API skipped or failed:', e.message);
+        }
+      }
+    }
+
+    // --- STEP 2: ScraperAPI Web Scraping Fallback ---
     if (process.env.SCRAPERAPI_KEY) {
       try {
-        // Detect JS-heavy sites like Best Buy to selectively enable render=true
         const needsJsRender = cleanUrl.toLowerCase().includes('bestbuy');
         const renderParam = needsJsRender ? '&render=true' : '';
-        
-        console.log(`Fetching ${cleanUrl} via ScraperAPI (JS Render: ${needsJsRender})...`);
         const scraperApiUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPERAPI_KEY}&url=${encodeURIComponent(cleanUrl)}${renderParam}`;
         
-        // Increase timeout for JS-rendered requests (25s vs 15s)
-        const timeoutMs = needsJsRender ? 25000 : 15000;
-        const response = await axios.get(scraperApiUrl, { timeout: timeoutMs });
+        console.log(`Fetching ${cleanUrl} via ScraperAPI...`);
+        const response = await axios.get(scraperApiUrl, { timeout: needsJsRender ? 25000 : 15000 });
 
         if (response && response.data) {
           const $ = cheerio.load(response.data);
 
-          // 1. Check for structured JSON-LD data
-          $('script[type="application/ld+json"]').each((_, el) => {
-            try {
-              const jsonData = JSON.parse($(el).html() || '{}');
-              
-              const offers = jsonData.offers || (jsonData['@graph'] && jsonData['@graph'].find(o => o.offers)?.offers);
-              if (offers) {
-                const offerObj = Array.isArray(offers) ? offers[0] : offers;
-                const price = offerObj.price || offerObj.lowPrice;
-                if (price) extractedExactPrice = parseFloat(price);
-              } else if (jsonData.price) {
-                extractedExactPrice = parseFloat(jsonData.price);
-              }
-            } catch (e) {}
-          });
-
-          // 2. Fallback to OpenGraph / Schema Meta tags
+          // Dedicated Best Buy DOM Selector Extraction
           if (!extractedExactPrice) {
-            const metaPrice = 
-              $('meta[property="product:price:amount"]').attr('content') ||
-              $('meta[property="og:price:amount"]').attr('content') ||
-              $('meta[itemprop="price"]').attr('content');
+            const testPrice = $('[data-testid="customer-price"] span').first().text() || 
+                              $('[data-automation="product-price"]').first().text() ||
+                              $('.price_F22T3').first().text();
             
-            if (metaPrice) extractedExactPrice = parseFloat(metaPrice);
+            const priceMatch = testPrice.match(/[\d,]+\.\d{2}/);
+            if (priceMatch) {
+              extractedExactPrice = parseFloat(priceMatch[0].replace(/,/g, ''));
+            }
+          }
+
+          // JSON-LD Fallback
+          if (!extractedExactPrice) {
+            $('script[type="application/ld+json"]').each((_, el) => {
+              try {
+                const jsonData = JSON.parse($(el).html() || '{}');
+                const offers = jsonData.offers || (jsonData['@graph'] && jsonData['@graph'].find(o => o.offers)?.offers);
+                if (offers) {
+                  const offerObj = Array.isArray(offers) ? offers[0] : offers;
+                  const price = offerObj.price || offerObj.lowPrice;
+                  if (price) extractedExactPrice = parseFloat(price);
+                }
+              } catch (e) {}
+            });
           }
 
           $('script, style, svg, nav, footer, iframe').remove();
@@ -108,9 +131,9 @@ app.post('/api/breakdown', async (req, res) => {
     ${extractedExactPrice ? `Verified Listed Page Price: $${extractedExactPrice} CAD` : ''}
 
     INSTRUCTIONS:
-    1. Determine the exact LISTED PREBUILT PRICE in CAD ($). ${extractedExactPrice ? `The actual verified product price is $${extractedExactPrice} CAD.` : ''}
+    1. Determine the exact LISTED PREBUILT PRICE in CAD ($). ${extractedExactPrice ? `Use $${extractedExactPrice} CAD directly.` : ''}
     2. Extract individual hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
-    3. Keep part names clean and concise for retail searches (e.g., "Core Ultra 7 265F" or "Ryzen 7 5700").
+    3. Keep part names clean and concise for retail searches (e.g., "Core Ultra 7 265F").
     4. Provide realistic individual retail price estimates in CAD ($) as plain numbers.
     `;
 
@@ -143,14 +166,12 @@ app.post('/api/breakdown', async (req, res) => {
     });
 
     const result = JSON.parse(response.text);
-
     const finalPrebuiltPrice = extractedExactPrice || Number(result.prebuiltPriceCAD) || 0;
 
     let totalPartsCostCAD = 0;
     const formattedParts = result.parts.map(part => {
       const priceNum = Number(part.estimatedPriceCAD) || 0;
       totalPartsCostCAD += priceNum;
-
       return {
         ...part,
         estimatedPriceFormatted: `$${priceNum.toFixed(2)} CAD`,
