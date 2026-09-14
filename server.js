@@ -10,23 +10,28 @@ app.use(express.json());
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// Helper to clean search keywords for Canadian retailers
-function sanitizePartName(name) {
+// Clean names down to key hardware model numbers for reliable retailer searching
+function cleanPartForRetailerSearch(name) {
   if (!name) return '';
-  return name
-    .replace(/\b(DDR4|DDR5|PCIe|NVMe|SSD|RAM|MHz|CL\d+|8GB|16GB|32GB|64GB|1TB|2TB|Desktop|Gaming|Graphics|Card|Processor|Power Supply)\b/gi, '')
+  
+  let cleaned = name
+    .replace(/\b(Intel|AMD|NVIDIA|GeForce|Radeon|Corsair|Kingston|Samsung|Crucial|MSI|ASUS|Gigabyte|EVGA|Thermaltake|DeepCool|Cooler Master|Western Digital|WD|Seagate)\b/gi, '')
+    .replace(/\b(DDR4|DDR5|PCIe|NVMe|M\.2|SSD|RAM|MHz|CL\d+|Desktop|Gaming|Graphics|Card|Processor|Power Supply|Modular|80\+|Plus|Gold|Bronze|Chassis|Tower|Case)\b/gi, '')
     .replace(/[^\w\s-]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+
+  // Fallback to original name if cleaning stripped everything
+  return cleaned.length >= 3 ? cleaned : name;
 }
 
-// Generate active search links for major Canadian stores
+// Generate precise search URLs across Canadian hardware stores
 function buildRetailerLinks(partName) {
-  const cleanKeyword = sanitizePartName(partName) || partName;
-  const encodedQuery = encodeURIComponent(cleanKeyword);
+  const keyword = cleanPartForRetailerSearch(partName);
+  const encodedQuery = encodeURIComponent(keyword);
 
   return {
-    canadaComputers: `https://www.canadacomputers.com/index.php?cPath=&sf=${encodedQuery}`,
+    canadaComputers: `https://www.canadacomputers.com/search/results_setting.php?keywords=${encodedQuery}`,
     amazonCA: `https://www.amazon.ca/s?k=${encodedQuery}`,
     memoryExpress: `https://www.memoryexpress.com/Search/Products?Search=${encodedQuery}`,
     neweggCA: `https://www.newegg.ca/p/pl?d=${encodedQuery}`
@@ -44,55 +49,58 @@ app.post('/api/breakdown', async (req, res) => {
     const cleanSlug = decodeURIComponent(rawSlug).replace(/[-_]/g, ' ');
 
     let pageText = '';
-    let extractedMetaPrice = null;
+    let extractedExactPrice = null;
 
-    // Fetch via ScraperAPI if configured
     if (process.env.SCRAPERAPI_KEY) {
       try {
-        console.log('Fetching page content via ScraperAPI...');
+        console.log('Fetching webpage via ScraperAPI...');
         const scraperApiUrl = `http://api.scraperapi.com?api_key=${process.env.SCRAPERAPI_KEY}&url=${encodeURIComponent(cleanUrl)}`;
         const response = await axios.get(scraperApiUrl, { timeout: 15000 });
 
         if (response && response.data) {
           const $ = cheerio.load(response.data);
 
-          // Attempt structured JSON-LD or Meta extraction for accurate prebuilt price
-          $('script[type="application/ld+json"]').each((_, el) => {
-            try {
-              const json = JSON.parse($(el).html());
-              const offers = json.offers || (json['@graph'] && json['@graph'].find(i => i.offers)?.offers);
-              if (offers) {
-                const price = Array.isArray(offers) ? offers[0]?.price : offers.price;
-                if (price) extractedMetaPrice = parseFloat(price);
-              }
-            } catch (e) {}
+          // 1. Check for Best Buy / Next.js embedded JSON-LD or state payload before removing script tags
+          $('script').each((_, el) => {
+            const content = $(el).html() || '';
+            if (content.includes('price') || content.includes('salePrice')) {
+              try {
+                // Regex search for JSON price key patterns like "price":2499.99 or "salePrice":2499.99
+                const priceMatch = content.match(/"(?:salePrice|price|offerPrice)":\s*([\d\.]+)/i);
+                if (priceMatch && priceMatch[1]) {
+                  const p = parseFloat(priceMatch[1]);
+                  if (p > 100) extractedExactPrice = p; // Avoid matching tax or rating numbers
+                }
+              } catch (e) {}
+            }
           });
 
-          if (!extractedMetaPrice) {
+          // 2. Fallback to OpenGraph meta tag price if JSON script search yields nothing
+          if (!extractedExactPrice) {
             const metaPrice = $('meta[property="product:price:amount"]').attr('content') || $('meta[property="og:price:amount"]').attr('content');
-            if (metaPrice) extractedMetaPrice = parseFloat(metaPrice);
+            if (metaPrice) extractedExactPrice = parseFloat(metaPrice);
           }
 
           $('script, style, svg, nav, footer, iframe').remove();
           pageText = $('body').text().replace(/\s+/g, ' ').slice(0, 8000);
         }
       } catch (err) {
-        console.warn('ScraperAPI error:', err.message);
+        console.warn('ScraperAPI fetch failed:', err.message);
       }
     }
 
     const prompt = `
-    You are an expert PC hardware component deconstructor.
-    Target Prebuilt PC URL: "${cleanUrl}"
-    Product Title/Slug: "${cleanSlug}"
-    Page Content: "${pageText.slice(0, 4000)}"
-    ${extractedMetaPrice ? `Explicit Webpage Listing Price: $${extractedMetaPrice} CAD` : ''}
+    You are an expert PC hardware extractor.
+    Target Prebuilt PC Link: "${cleanUrl}"
+    Product Slug: "${cleanSlug}"
+    Webpage Content: "${pageText.slice(0, 4000)}"
+    ${extractedExactPrice ? `Exact Webpage Listed Price: $${extractedExactPrice} CAD` : ''}
 
     INSTRUCTIONS:
-    1. Extract the PREBUILT RETAIL SALE PRICE in CAD ($). Ignore strike-through/original prices or financing options (e.g. $50/mo). Use explicit listing price if available.
-    2. Extract individual components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
-    3. Output concise, clean part names (e.g. "Intel Core Ultra 7 265F" instead of "Intel Core Ultra 7 265F 20-Core Processor").
-    4. Provide realistic individual CAD retail price estimates (numeric only).
+    1. Extract the PREBUILT SALE PRICE in CAD ($). ${extractedExactPrice ? `Use $${extractedExactPrice} CAD directly.` : ''}
+    2. Extract individual hardware components (CPU, GPU, RAM, Storage, Motherboard, Power Supply, Case).
+    3. Output minimal, accurate part names for searching (e.g., "Core Ultra 7 265F" instead of "Intel Core Ultra 7 265F 20-Core Processor").
+    4. Provide realistic individual retail price estimates in CAD ($) as plain numbers.
     `;
 
     const response = await ai.models.generateContent({
@@ -104,7 +112,7 @@ app.post('/api/breakdown', async (req, res) => {
           type: 'OBJECT',
           properties: {
             pcTitle: { type: 'STRING' },
-            prebuiltPriceCAD: { type: 'NUMBER', description: 'Listed prebuilt retail price in CAD (numeric only)' },
+            prebuiltPriceCAD: { type: 'NUMBER' },
             parts: {
               type: 'ARRAY',
               items: {
@@ -125,8 +133,7 @@ app.post('/api/breakdown', async (req, res) => {
 
     const result = JSON.parse(response.text);
 
-    // Overwrite with exact JSON-LD price if extracted directly
-    const finalPrebuiltPrice = extractedMetaPrice || Number(result.prebuiltPriceCAD) || 0;
+    const finalPrebuiltPrice = extractedExactPrice || Number(result.prebuiltPriceCAD) || 0;
 
     let totalPartsCostCAD = 0;
     const formattedParts = result.parts.map(part => {
