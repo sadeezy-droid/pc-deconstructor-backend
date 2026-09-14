@@ -54,17 +54,29 @@ function cleanPartForRetailerSearch(name, category = '') {
   return cleaned.length >= 2 ? cleaned : name;
 }
 
-// Build precise retailer search links using category context
-function buildRetailerLinks(partName, category = '') {
+// Build precise retailer search matrix using category context
+function buildRetailerMatrix(partName, category = '') {
   const keyword = cleanPartForRetailerSearch(partName, category);
   const encodedQuery = encodeURIComponent(keyword);
 
-  return {
-    canadaComputers: `https://www.canadacomputers.com/en/search?s=${encodedQuery}&t=1`,
-    amazonCA: `https://www.amazon.ca/s?k=${encodedQuery}`,
-    memoryExpress: `https://www.memoryexpress.com/Search/Products?Search=${encodedQuery}`,
-    neweggCA: `https://www.newegg.ca/p/pl?d=${encodedQuery}`
-  };
+  return [
+    {
+      store: 'Canada Computers',
+      searchUrl: `https://www.canadacomputers.com/en/search?s=${encodedQuery}&t=1`
+    },
+    {
+      store: 'Amazon CA',
+      searchUrl: `https://www.amazon.ca/s?k=${encodedQuery}`
+    },
+    {
+      store: 'Memory Express',
+      searchUrl: `https://www.memoryexpress.com/Search/Products?Search=${encodedQuery}`
+    },
+    {
+      store: 'Newegg CA',
+      searchUrl: `https://www.newegg.ca/p/pl?d=${encodedQuery}`
+    }
+  ];
 }
 
 // Main API Breakdown Endpoint
@@ -81,10 +93,10 @@ app.post('/api/breakdown', async (req, res) => {
     const urlParts = cleanUrl.split('/');
     const cleanSlug = urlParts[urlParts.length - 1] || urlParts[urlParts.length - 2] || '';
 
-    let extractedExactPrice = manualPrice; // Priority 1: User Manual Input Override
+    let extractedExactPrice = manualPrice;
     let pageText = '';
 
-    // STEP 1: Direct Best Buy API bypass (runs ONLY if no manual price supplied)
+    // STEP 1: Direct Best Buy API bypass
     if (!extractedExactPrice && cleanUrl.includes('bestbuy.ca')) {
       const sku = getBestBuySku(cleanUrl);
       if (sku) {
@@ -109,7 +121,6 @@ app.post('/api/breakdown', async (req, res) => {
         const response = await axios.get(scraperUrl, { timeout: 25000 });
         const $ = cheerio.load(response.data);
 
-        // DOM Price parsing if price is still missing
         if (!extractedExactPrice) {
           const priceSelectors = [
             '[data-testid="customer-price"] span',
@@ -130,7 +141,6 @@ app.post('/api/breakdown', async (req, res) => {
           }
         }
 
-        // Clean DOM body text for Gemini analysis
         $('script, style, noscript, nav, footer, header').remove();
         pageText = $('body').text().replace(/\s+/g, ' ').trim();
 
@@ -139,12 +149,11 @@ app.post('/api/breakdown', async (req, res) => {
       }
     }
 
-    // Fallback pageText to slug if scraping returned empty text
     if (!pageText) {
       pageText = `Product listing slug: ${cleanSlug.replace(/-/g, ' ')}`;
     }
 
-    // STEP 3: Analyze Specs using Gemini LLM (Locked to gemini-3.6-flash)
+    // STEP 3: Analyze Specs using Gemini LLM
     const model = genAI.getGenerativeModel({
       model: 'gemini-3.6-flash',
       generationConfig: { responseMimeType: 'application/json' }
@@ -185,10 +194,7 @@ Return ONLY JSON matching this structure:
     const result = await model.generateContent(prompt);
     const jsonResponse = JSON.parse(result.response.text());
 
-    // Calculate totals and format values safely
     let totalPartsCostCAD = 0;
-
-    // Guaranteed Price Extraction Hierarchy
     let parsedGeminiPrice = parseFloat(jsonResponse.prebuiltPriceCAD);
     if (isNaN(parsedGeminiPrice)) parsedGeminiPrice = 0;
 
@@ -201,8 +207,9 @@ Return ONLY JSON matching this structure:
       return {
         category: part.category,
         name: part.name,
+        estimatedPriceCAD: priceNum,
         estimatedPriceFormatted: `$${priceNum.toFixed(2)} CAD`,
-        retailerLinks: buildRetailerLinks(part.name, part.category)
+        retailerMatrix: buildRetailerMatrix(part.name, part.category)
       };
     });
 
@@ -213,10 +220,11 @@ Return ONLY JSON matching this structure:
 
     return res.json({
       pcTitle: jsonResponse.pcTitle,
-      prebuiltPriceCAD: finalPrebuiltPrice, // Raw number for frontend state/editor
-      prebuiltPriceFormatted: `$${finalPrebuiltPrice.toFixed(2)} CAD`, // Formatted display string
+      prebuiltPriceCAD: finalPrebuiltPrice,
+      prebuiltPriceFormatted: `$${finalPrebuiltPrice.toFixed(2)} CAD`,
       totalPartsCostCAD: totalPartsCostCAD,
       totalPartsCostFormatted: `$${totalPartsCostCAD.toFixed(2)} CAD`,
+      priceDifferenceCAD: priceDiff,
       priceDifferenceFormatted: priceDiffFormatted,
       parts: formattedParts
     });
